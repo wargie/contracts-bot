@@ -11,11 +11,10 @@ from .keyboards import reply_main_menu_kb
 
 router = Router()
 
-# ---------- локальная FSM ----------
 class CheckInnFSM(StatesGroup):
     wait_inn = State()
 
-# ---------- утилиты ----------
+# -------- utils --------
 async def _try_send(coro_factory, retries: int = 3, backoff: float = 1.0):
     last_exc = None
     for i in range(retries):
@@ -28,140 +27,170 @@ async def _try_send(coro_factory, retries: int = 3, backoff: float = 1.0):
 
 def _ms_to_str(v) -> str:
     if not v:
-        return "-"
+        return ""
     try:
         iv = int(v)
         return datetime.utcfromtimestamp(iv / 1000).strftime("%d.%m.%Y")
     except Exception:
-        return "-"
+        return ""
 
-def _after_check_kb() -> InlineKeyboardMarkup:
+def _kb_after() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="В главное меню", callback_data="check_home")],
         [InlineKeyboardButton(text="Новая проверка", callback_data="check_new")],
         [InlineKeyboardButton(text="Выход", callback_data="check_exit")],
     ])
 
-def _sections_from_info(info: dict) -> list[str]:
-    """
-    Строим несколько коротких блоков (чтобы не упереться в лимит 4096 символов).
-    Показываем максимум данных, которые есть у DaData.
-    """
-    s = info.get("summary", info)  # на случай старого формата
+def _line(label: str, value: str) -> str:
+    return f"{label}: {value}" if value else ""
+
+def _join_nonempty(lines: list[str]) -> str:
+    return "\n".join([ln for ln in lines if ln])
+
+def _sections(info: dict) -> list[str]:
+    s = info.get("summary", info)
     d = info.get("details", {})
 
     # Заголовок
-    management = s.get("management") or "-"
-    if ":" in management:
-        management = management.replace(":", ",", 1)
-    opf = s.get("opf_full") or s.get("opf_short") or "-"
-    status = (s.get("status") or "-").upper()
+    opf = s.get("opf_full") or s.get("opf_short") or ""
+    status = (s.get("status") or "").upper()
     reg = _ms_to_str(s.get("registration_date") or s.get("ogrn_date"))
     liq = _ms_to_str(s.get("liquidation_date"))
     okved = s.get("okved") or {}
-    okved_line = f"{okved.get('code')} — {okved.get('name') or '-'}" if okved.get("code") else "-"
+    okved_line = " — ".join([okved.get("code", ""), okved.get("name", "")]).strip(" —")
 
-    header = (
-        f"🧾 <b>{s.get('name') or '-'}</b>\n"
-        f"ОПФ: {opf}\n"
-        f"Статус: {status}\n"
-        f"Дата регистрации: {reg}" + (f" • Ликвидация: {liq}" if liq != "-" else "") + "\n"
-        f"ИНН/КПП: {s.get('inn') or '-'} / {s.get('kpp') or '-'}\n"
-        f"ОГРН: {s.get('ogrn') or '-'}\n"
-        f"Адрес: {s.get('address') or '-'}\n"
-        f"Руководитель: {management}\n"
-        f"ОКВЭД (осн.): {okved_line}\n"
-    )
-
-    # Коды и даты
+    # ИНН/КПП + ОГРН(ИП)
     ids = (d.get("ids") or {})
-    st = (d.get("state") or {})
-    more_codes = (
-        "🔢 <b>Коды, даты</b>\n"
-        f"ОКПО: {ids.get('okpo') or '-'} • ОКАТО: {ids.get('okato') or '-'} • ОКТМО: {ids.get('oktmo') or '-'}\n"
-        f"ОКОГУ: {ids.get('okogu') or '-'} • ОКФС: {ids.get('okfs') or '-'}\n"
-        f"Дата ОГРН: {_ms_to_str(d.get('ogrn_date'))}\n"
-        f"Актуальность данных: {_ms_to_str(st.get('actuality_date'))}\n"
-        f"Признак филиала: {(d.get('branch') or {}).get('branch_type') or '-'} • Филиалов: {(d.get('branch') or {}).get('branch_count') or '-'}"
-    )
+    subj_type = d.get("type")
+    kpp = ids.get("kpp") if subj_type == "LEGAL" else None
+    ogrn_label = "ОГРНИП" if subj_type == "INDIVIDUAL" else "ОГРН"
 
-    # ОКВЭДы (дополнительные)
+    header = _join_nonempty([
+        f"🧾 <b>{s.get('name') or '-'}</b>",
+        _line("ОПФ", opf),
+        _line("Статус", status),
+        _join_nonempty([
+            _line("Дата регистрации", reg),
+            _line("Ликвидация", liq),
+        ]).replace("\n", " • "),
+        _join_nonempty([
+            f"ИНН {s.get('inn') or ''}",
+            f"КПП {kpp}" if kpp else "",
+        ]).replace("\n", " / "),
+        _line(ogrn_label, s.get("ogrn") or ""),
+        _line("Адрес", s.get("address") or ""),
+        _line("Руководитель", (s.get("management") or "").replace(":", ",", 1)),
+        _line("ОКВЭД (осн.)", okved_line),
+    ])
+
+    # Коды/даты
+    ids_blk = d.get("ids") or {}
+    st = d.get("state") or {}
+    codes = _join_nonempty([
+        "🔢 <b>Коды, даты</b>",
+        _join_nonempty([
+            f"ОКПО: {ids_blk.get('okpo')}" if ids_blk.get("okpo") else "",
+            f"ОКАТО: {ids_blk.get('okato')}" if ids_blk.get("okato") else "",
+            f"ОКТМО: {ids_blk.get('oktmo')}" if ids_blk.get("oktmo") else "",
+        ]).replace("\n", " • "),
+        _join_nonempty([
+            f"ОКОГУ: {ids_blk.get('okogu')}" if ids_blk.get("okogu") else "",
+            f"ОКФС: {ids_blk.get('okfs')}" if ids_blk.get("okfs") else "",
+        ]).replace("\n", " • "),
+        _line("Дата ОГРН", _ms_to_str(d.get("ogrn_date"))),
+        _line("Актуальность данных", _ms_to_str(st.get("actuality_date"))),
+        _join_nonempty([
+            f"Признак филиала: {(d.get('branch') or {}).get('branch_type')}" if (d.get("branch") or {}).get("branch_type") and subj_type == "LEGAL" else "",
+            f"Филиалов: {(d.get('branch') or {}).get('branch_count')}" if (d.get("branch") or {}).get("branch_count") and subj_type == "LEGAL" else "",
+        ]).replace("\n", " • "),
+    ])
+
+    # Доп. ОКВЭДы
     okveds = (d.get("okved") or {}).get("list") or []
     if okveds:
-        lines = [f"{it.get('code')} — {it.get('name') or '-'}" for it in okveds[:40]]
-        okved_block = "📚 <b>Доп. ОКВЭДы</b>\n" + "\n".join(lines)
+        okved_list = "\n".join([f"{it.get('code')} — {it.get('name') or ''}".strip(" —") for it in okveds[:40]])
+        okved_block = "📚 <b>Доп. ОКВЭДы</b>\n" + okved_list
     else:
-        okved_block = "📚 <b>Доп. ОКВЭДы</b>\n—"
+        okved_block = ""
 
     # Адрес подробно
     ad = ((d.get("address") or {}).get("data")) or {}
-    addr_block = (
-        "📍 <b>Адрес подробно</b>\n"
-        f"Индекс: {ad.get('postal_code') or '-'} • Налоговая: {ad.get('tax_office') or '-'}\n"
-        f"Регион: {ad.get('region_with_type') or '-'}\n"
-        f"Город/р-н: {(ad.get('city_with_type') or '-')}, {(ad.get('city_district_with_type') or '-')}\n"
-        f"Улица/дом: {(ad.get('street_with_type') or '-')}, {ad.get('house') or '-'}\n"
-        f"FIAС: {ad.get('fias_id') or '-'} (lvl {ad.get('fias_level') or '-'}) • КЛАДР: {ad.get('kladr_id') or '-'}\n"
-        f"Координаты: {ad.get('geo_lat') or '-'}, {ad.get('geo_lon') or '-'} • Часовой пояс: {ad.get('timezone') or '-'}"
-    )
+    addr_lines = _join_nonempty([
+        "📍 <b>Адрес подробно</b>",
+        _join_nonempty([
+            f"Индекс: {ad.get('postal_code')}" if ad.get("postal_code") else "",
+            f"Налоговая: {ad.get('tax_office')}" if ad.get("tax_office") else "",
+        ]).replace("\n", " • "),
+        _line("Регион", ad.get("region_with_type") or ""),
+        _join_nonempty([
+            f"Город/р-н: {(ad.get('city_with_type') or '')}",
+            f"{(ad.get('city_district_with_type') or '')}",
+        ]).replace("\n", ", "),
+        _join_nonempty([
+            f"Улица/дом: {(ad.get('street_with_type') or '')}",
+            f"{ad.get('house') or ''}",
+        ]).replace("\n", ", "),
+        _join_nonempty([
+            f"FIAС: {ad.get('fias_id')} (lvl {ad.get('fias_level')})" if ad.get("fias_id") else "",
+            f"КЛАДР: {ad.get('kladr_id')}" if ad.get("kladr_id") else "",
+        ]).replace("\n", " • "),
+        _join_nonempty([
+            f"Координаты: {ad.get('geo_lat')}, {ad.get('geo_lon')}" if ad.get("geo_lat") and ad.get("geo_lon") else "",
+            f"Часовой пояс: {ad.get('timezone')}" if ad.get("timezone") else "",
+        ]).replace("\n", " • "),
+    ])
 
     # Контакты
     contacts = d.get("contacts") or {}
-    phones = ", ".join(contacts.get("phones") or []) or "-"
-    emails = ", ".join(contacts.get("emails") or []) or "-"
-    website = contacts.get("website") or "-"
-    contacts_block = (
-        "☎️ <b>Контакты</b>\n"
-        f"Телефоны: {phones}\n"
-        f"E-mail: {emails}\n"
-        f"Сайт: {website}"
-    )
+    phones = ", ".join(contacts.get("phones") or [])
+    emails = ", ".join(contacts.get("emails") or [])
+    contacts_block = _join_nonempty([
+        "☎️ <b>Контакты</b>",
+        _line("Телефоны", phones),
+        _line("E-mail", emails),
+        _line("Сайт", contacts.get("website") or ""),
+    ])
 
-    # Состав, капитал, сотрудники (если есть)
-    persons = d.get("persons") or {}
+    # Прочее
     capital = d.get("capital") or {}
     emp = d.get("employee_count")
-    more_block = (
-        "🏛️ <b>Дополнительно</b>\n"
-        f"Уставный капитал: {capital.get('value') or '-'} ({capital.get('type') or '-'})\n"
-        f"Численность сотрудников: {emp or '-'}\n"
-        f"Документы/лицензии/власти: "
-        f"{'есть' if d.get('documents') else '—'}/"
-        f"{'есть' if d.get('licenses') else '—'}/"
-        f"{'есть' if d.get('authorities') else '—'}"
-    )
+    misc = _join_nonempty([
+        "🏛️ <b>Дополнительно</b>",
+        _line("Уставный капитал", f"{capital.get('value')} ({capital.get('type')})" if capital.get("value") else ""),
+        _line("Численность сотрудников", str(emp) if emp is not None else ""),
+        _join_nonempty([
+            "Документы" if d.get("documents") else "",
+            "Лицензии" if d.get("licenses") else "",
+            "Органы" if d.get("authorities") else "",
+        ])  # если ничего нет — строка исчезнет
+    ])
 
-    return [header, more_codes, okved_block, addr_block, contacts_block, more_block]
+    # Собираем секции без пустых блоков
+    blocks = [header, codes, okved_block, addr_lines, contacts_block, misc]
+    return [b for b in blocks if b.strip()]
 
-# ---------- вход из главного меню ----------
+# -------- entry points --------
 @router.message(F.text.casefold() == "запрос по инн")
 async def on_check_menu(m: Message, state: FSMContext):
     await state.set_state(CheckInnFSM.wait_inn)
     await _try_send(lambda: m.answer("Введите ИНН компании"))
 
-# ---------- обработка свободного ввода ИНН ----------
 @router.message(CheckInnFSM.wait_inn, F.text.regexp(r"^\D*\d[\d\D]*$"))
 async def on_inn_entered(m: Message, state: FSMContext):
-    raw = (m.text or "").strip()
-    inn = "".join(ch for ch in raw if ch.isdigit())
+    inn = "".join(ch for ch in (m.text or "").strip() if ch.isdigit())
     if len(inn) not in (10, 12):
         await _try_send(lambda: m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова."))
         return
-    provider = DaDataProvider()
-    info = await provider.verify(inn=inn, kpp=None)
+    info = await DaDataProvider().verify(inn=inn, kpp=None)
     if not info.get("found"):
-        await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_after_check_kb()))
+        await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_kb_after()))
         await state.clear()
         return
-
-    # Отправляем секциями
-    for block in _sections_from_info(info):
+    for block in _sections(info):
         await _try_send(lambda b=block: m.answer(b))
-
-    await _try_send(lambda: m.answer("—", reply_markup=_after_check_kb()))
+    await _try_send(lambda: m.answer("—", reply_markup=_kb_after()))
     await state.clear()
 
-# ---------- команда /checkinn (поддержка старого варианта) ----------
 @router.message(Command("checkinn"))
 async def cmd_checkinn(m: Message, state: FSMContext):
     parts = (m.text or "").split()
@@ -170,27 +199,18 @@ async def cmd_checkinn(m: Message, state: FSMContext):
         await state.set_state(CheckInnFSM.wait_inn)
         await _try_send(lambda: m.answer("Введите ИНН компании"))
         return
-
     inn = "".join(ch for ch in args[0] if ch.isdigit())
-    kpp = "".join(ch for ch in (args[1] if len(args) > 1 else "")) or None
-
     if len(inn) not in (10, 12):
         await _try_send(lambda: m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова."))
         return
-
-    provider = DaDataProvider()
-    info = await provider.verify(inn=inn, kpp=kpp)
-
+    info = await DaDataProvider().verify(inn=inn, kpp=None)
     if not info.get("found"):
-        await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_after_check_kb()))
+        await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_kb_after()))
         return
-
-    for block in _sections_from_info(info):
+    for block in _sections(info):
         await _try_send(lambda b=block: m.answer(b))
+    await _try_send(lambda: m.answer("—", reply_markup=_kb_after()))
 
-    await _try_send(lambda: m.answer("—", reply_markup=_after_check_kb()))
-
-# ---------- пост-действия ----------
 @router.callback_query(F.data == "check_home")
 async def check_home(c: CallbackQuery, state: FSMContext):
     await state.clear()

@@ -1,0 +1,10 @@
+from enum import Enum
+
+
+class ManagerPartyType(str, Enum):
+    EMPLOYEE = "EMPLOYEE"
+    FOREIGNER = "FOREIGNER"
+    LEGAL = "LEGAL"
+
+    def __str__(self) -> str:
+        return str(self.value)

@@ -1,5 +1,4 @@
 import os
-import asyncio
 from aiogram import Router, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, FSInputFile
@@ -20,7 +19,7 @@ from .keyboards import (
 router = Router()
 
 
-# /start — сразу показываем главное меню (reply keyboard)
+# /start — сразу главное меню
 @router.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
@@ -29,31 +28,27 @@ async def start(m: Message, state: FSMContext):
         "Выбери действие:",
         reply_markup=reply_main_menu_kb(),
     )
-    # дальше пользователь нажимает кнопку «Запрос по ИНН» или «Договор»
 
 
-# ===== Пример привязки кнопок главного меню =====
-
-@router.message(F.text.lower() == "договор")
+# Главное меню — «Договор»
+@router.message(F.text.regexp(r"(?i)^договор$"))
 async def goto_contract_flow(m: Message, state: FSMContext):
     await m.answer("Выберите тип договора:", reply_markup=choose_contract_type_kb())
     await state.set_state(ContractFSM.contract_type)
 
 
-@router.message(F.text.lower() == "запрос по инн")
-async def goto_checkinn(m: Message, state: FSMContext):
-    # если у тебя есть отдельный сценарий/хендлеры для checkinn — просто дай инструкцию
-    await m.answer("Введите ИНН (или ИНН и КПП через пробел) для проверки:")
-    # дальнейшая обработка остаётся в твоих текущих хендлерах checkinn
+# ВАЖНО: обработчик «Запрос по ИНН» находится в checkinn.py
+# Здесь НЕ дублируем, чтобы не сбивать состояние FSM.
 
 
-@router.message(F.text.lower() == "выход")
+# Главное меню — «Выход»
+@router.message(F.text.regexp(r"(?i)^выход$"))
 async def bye(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("Спасибо за использование! Чтобы начать заново — /start")
 
 
-# ===== Ниже — уже существующий «договорный» сценарий (без изменений) =====
+# ===== Ниже — «договорный» сценарий =====
 
 @router.callback_query(ContractFSM.contract_type, F.data.startswith("type_"))
 async def set_type(c: CallbackQuery, state: FSMContext):
@@ -62,20 +57,17 @@ async def set_type(c: CallbackQuery, state: FSMContext):
     await state.set_state(ContractFSM.customer_name)
     await c.answer()
 
-
 @router.message(ContractFSM.customer_name)
 async def customer_name(m: Message, state: FSMContext):
     await state.update_data(customer_name=m.text.strip())
     await m.answer("ИНН Заказчика:")
     await state.set_state(ContractFSM.customer_inn)
 
-
 @router.message(ContractFSM.customer_inn)
 async def customer_inn(m: Message, state: FSMContext):
     await state.update_data(customer_inn=m.text.strip())
     await m.answer("КПП Заказчика (если есть) или '-' :")
     await state.set_state(ContractFSM.customer_kpp)
-
 
 @router.message(ContractFSM.customer_kpp)
 async def customer_kpp(m: Message, state: FSMContext):
@@ -84,20 +76,17 @@ async def customer_kpp(m: Message, state: FSMContext):
     await m.answer("Полное наименование Исполнителя:")
     await state.set_state(ContractFSM.contractor_name)
 
-
 @router.message(ContractFSM.contractor_name)
 async def contractor_name(m: Message, state: FSMContext):
     await state.update_data(contractor_name=m.text.strip())
     await m.answer("ИНН Исполнителя:")
     await state.set_state(ContractFSM.contractor_inn)
 
-
 @router.message(ContractFSM.contractor_inn)
 async def contractor_inn(m: Message, state: FSMContext):
     await state.update_data(contractor_inn=m.text.strip())
     await m.answer("КПП Исполнителя (если есть) или '-' :")
     await state.set_state(ContractFSM.contractor_kpp)
-
 
 @router.message(ContractFSM.contractor_kpp)
 async def contractor_kpp(m: Message, state: FSMContext):
@@ -106,13 +95,11 @@ async def contractor_kpp(m: Message, state: FSMContext):
     await m.answer("Номер договора:")
     await state.set_state(ContractFSM.params_number)
 
-
 @router.message(ContractFSM.params_number)
 async def params_number(m: Message, state: FSMContext):
     await state.update_data(number=m.text.strip())
     await m.answer("Дата (напр. 30.09.2025):")
     await state.set_state(ContractFSM.params_date)
-
 
 @router.message(ContractFSM.params_date)
 async def params_date(m: Message, state: FSMContext):
@@ -120,13 +107,11 @@ async def params_date(m: Message, state: FSMContext):
     await m.answer("Город заключения:")
     await state.set_state(ContractFSM.params_city)
 
-
 @router.message(ContractFSM.params_city)
 async def params_city(m: Message, state: FSMContext):
     await state.update_data(city=m.text.strip())
     await m.answer("Опишите предмет договора:")
     await state.set_state(ContractFSM.params_subject)
-
 
 @router.message(ContractFSM.params_subject)
 async def params_subject(m: Message, state: FSMContext):
@@ -134,13 +119,11 @@ async def params_subject(m: Message, state: FSMContext):
     await m.answer("Стоимость (с валютой):")
     await state.set_state(ContractFSM.params_price)
 
-
 @router.message(ContractFSM.params_price)
 async def params_price(m: Message, state: FSMContext):
     await state.update_data(price=m.text.strip())
     await m.answer("Порядок расчетов:")
     await state.set_state(ContractFSM.params_payment)
-
 
 @router.message(ContractFSM.params_payment)
 async def params_payment(m: Message, state: FSMContext):
@@ -148,13 +131,11 @@ async def params_payment(m: Message, state: FSMContext):
     await m.answer("Срок исполнения/действия:")
     await state.set_state(ContractFSM.params_term)
 
-
 @router.message(ContractFSM.params_term)
 async def params_term(m: Message, state: FSMContext):
     await state.update_data(term=m.text.strip())
     await m.answer("Штрафные санкции (или '-' ):")
     await state.set_state(ContractFSM.params_penalties)
-
 
 @router.message(ContractFSM.params_penalties)
 async def params_penalties(m: Message, state: FSMContext):
@@ -162,7 +143,6 @@ async def params_penalties(m: Message, state: FSMContext):
     await state.update_data(penalties=penalties)
     await m.answer("Выберите формат файла:", reply_markup=choose_output_kb())
     await state.set_state(ContractFSM.output_format)
-
 
 @router.callback_query(ContractFSM.output_format, F.data.startswith("out_"))
 async def output_choice(c: CallbackQuery, state: FSMContext):
@@ -174,7 +154,6 @@ async def output_choice(c: CallbackQuery, state: FSMContext):
     )
     await state.set_state(ContractFSM.confirm)
     await c.answer()
-
 
 @router.callback_query(ContractFSM.confirm, F.data == "confirm_yes")
 async def do_generate(c: CallbackQuery, state: FSMContext):
@@ -235,10 +214,11 @@ async def do_generate(c: CallbackQuery, state: FSMContext):
     for f in files:
         await c.message.answer_document(f)
 
+    # Краткий отчёт по проверке
     def line(v):
         if not v.get("found"):
             return "не найден"
-        return f"{v.get('name')} | ИНН {v.get('inn')} | ОГРН {v.get('ogrn')} | статус: {v.get('status')}"
+        return f"{v.get('name')} | ИНН {v.get('inn')} | ОГРН {v.get('ogrн')} | статус: {v.get('status')}"
 
     await c.message.answer(
         "Проверка контрагентов:\n"
@@ -248,7 +228,6 @@ async def do_generate(c: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await c.answer()
-
 
 @router.callback_query(ContractFSM.confirm, F.data == "confirm_no")
 async def cancel(c: CallbackQuery, state: FSMContext):

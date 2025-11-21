@@ -248,7 +248,6 @@ def _fit_blocks_to_telegram_limit(blocks: list[str], max_len: int = 3800) -> str
         if len(test) <= max_len:
             out.append(b)
         else:
-            # пробуем укоротить блок (обрежем до ближайшей границы)
             if len("\n\n".join(out)) < max_len:
                 remain = max_len - len("\n\n".join(out)) - 1
                 trimmed = (b[:remain]).rsplit("\n", 1)[0]
@@ -263,50 +262,57 @@ def _html_to_plain(s: str) -> str:
     return html.unescape(no_tags)
 
 
-# --- NEW: нормализация текста для PDF (убираем эмодзи и служебные вариации) ---
+# --- нормализация текста для PDF (убираем эмодзи и служебные вариации) ---
 _EMOJI_STRIP = {
     "🧾": "", "🔢": "", "📚": "", "📍": "", "☎️": "", "🏛️": "",
-    "—": "—",  # оставляем длинное тире как есть
+    "—": "—",
 }
 def _normalize_for_pdf(s: str) -> str:
     for k, v in _EMOJI_STRIP.items():
         s = s.replace(k, v)
-    # удалить вариационные селекторы/ZWJ
     s = re.sub(r"[\u200D\uFE0F]", "", s)
     return s.strip()
 
 
 # -------- entry points --------
-@router.message(F.text.casefold() == "запрос по инн")
+
+# Кнопка «Запрос по ИНН» в главном меню (регистронезависимо)
+@router.message(F.text.regexp(r"(?i)^запрос по инн$"))
 async def on_check_menu(m: Message, state: FSMContext):
     await state.set_state(CheckInnFSM.wait_inn)
     await _try_send(lambda: m.answer("Введите ИНН компании"))
 
-
-@router.message(CheckInnFSM.wait_inn, F.text.regexp(r"^\D*\d[\d\D]*$"))
+# Обработчик ввода ИНН, когда ждём ИНН
+@router.message(CheckInnFSM.wait_inn, F.text.regexp(r"^\s*\d{10,12}\s*$|^\s*\d{10}\s+\d{9}\s*$"))
 async def on_inn_entered(m: Message, state: FSMContext):
-    inn = "".join(ch for ch in (m.text or "").strip() if ch.isdigit())
+    raw = (m.text or "").strip()
+    # поддержим "ИНН" или "ИНН КПП"
+    parts = raw.split()
+    inn = "".join(ch for ch in parts[0] if ch.isdigit())
+    kpp = None
+    if len(parts) >= 2:
+        kpp = "".join(ch for ch in parts[1] if ch.isdigit())
+
     if len(inn) not in (10, 12):
         await _try_send(lambda: m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова."))
         return
 
-    info = await DaDataProvider().verify(inn=inn, kpp=None)
+    info = await DaDataProvider().verify(inn=inn, kpp=kpp)
     if not info.get("found"):
         await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_kb_after()))
         await state.clear()
         return
 
-    blocks = _compose_blocks(info)  # порядок важен для приоритета
+    blocks = _compose_blocks(info)
     report_html = _fit_blocks_to_telegram_limit(blocks)
     report_plain = _html_to_plain(report_html)
 
-    # сохраним в состоянии для генерации PDF
     await state.update_data(report_html=report_html, report_plain=report_plain, inn=inn)
     await state.set_state(CheckInnFSM.view)
 
     await _try_send(lambda: m.answer(report_html, parse_mode=ParseMode.HTML, reply_markup=_kb_after()))
 
-
+# Альтернативная команда /checkinn 7707083893
 @router.message(Command("checkinn"))
 async def cmd_checkinn(m: Message, state: FSMContext):
     parts = (m.text or "").split()
@@ -317,11 +323,15 @@ async def cmd_checkinn(m: Message, state: FSMContext):
         return
 
     inn = "".join(ch for ch in args[0] if ch.isdigit())
+    kpp = None
+    if len(args) >= 2:
+        kpp = "".join(ch for ch in args[1] if ch.isdigit())
+
     if len(inn) not in (10, 12):
         await _try_send(lambda: m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова."))
         return
 
-    info = await DaDataProvider().verify(inn=inn, kpp=None)
+    info = await DaDataProvider().verify(inn=inn, kpp=kpp)
     if not info.get("found"):
         await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_kb_after()))
         return
@@ -347,7 +357,7 @@ async def check_save_pdf(c: CallbackQuery, state: FSMContext):
         await c.answer("Не удалось сформировать PDF, повторите проверку.", show_alert=True)
         return
 
-    pdf_text = _normalize_for_pdf(report_plain)  # <-- без эмодзи и управляющих меток
+    pdf_text = _normalize_for_pdf(report_plain)
 
     os.makedirs("out", exist_ok=True)
     out_path = f"out/checkinn_{inn}.pdf"
@@ -355,20 +365,17 @@ async def check_save_pdf(c: CallbackQuery, state: FSMContext):
     await _try_send(lambda: c.message.answer_document(FSInputFile(out_path), caption=f"Отчёт по ИНН {inn}"))
     await c.answer()
 
-
 @router.callback_query(F.data == "check_home")
 async def check_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await _try_send(lambda: c.message.answer("Меню:", reply_markup=reply_main_menu_kb()))
     await c.answer()
 
-
 @router.callback_query(F.data == "check_new")
 async def check_new(c: CallbackQuery, state: FSMContext):
     await state.set_state(CheckInnFSM.wait_inn)
     await _try_send(lambda: c.message.answer("Введите ИНН компании"))
     await c.answer()
-
 
 @router.callback_query(F.data == "check_exit")
 async def check_exit(c: CallbackQuery, state: FSMContext):

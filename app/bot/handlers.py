@@ -2,14 +2,10 @@ import os
 import asyncio
 from datetime import datetime
 from aiogram import Router, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message, CallbackQuery, FSInputFile,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-)
+from aiogram.filters import CommandStart
+from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.fsm.context import FSMContext
 
-from ..verification.dadata import DaDataProvider
 from ..services.contract_builder import render_text, text_to_docx, text_to_pdf
 from ..models.contract import ContractInput, ContractParams
 from ..models.party import Party
@@ -19,15 +15,14 @@ from .keyboards import (
     choose_contract_type_kb, choose_output_kb, confirm_kb
 )
 
-router = Router()
+router = Router()  # корневой роутер бота
 
-# ----------------- утилиты -----------------
+# Подключаем подроутер проверки по ИНН
+from .checkinn import router as checkinn_router
+router.include_router(checkinn_router)
 
+# ---------- утилита надёжной отправки ----------
 async def _try_send(coro_factory, retries: int = 3, backoff: float = 1.0):
-    """
-    Надёжная отправка сообщения/редактирования:
-    coro_factory -> корутина без аргументов (например: lambda: message.answer(...))
-    """
     last_exc = None
     for i in range(retries):
         try:
@@ -35,61 +30,9 @@ async def _try_send(coro_factory, retries: int = 3, backoff: float = 1.0):
         except Exception as e:
             last_exc = e
             await asyncio.sleep(backoff * (i + 1))
-    # если так и не получилось — пробрасываем последнюю ошибку
     raise last_exc
 
-def _fmt_date_ms(v) -> str:
-    if not v:
-        return "-"
-    try:
-        iv = int(v)
-        if iv < 10_000_000_000:
-            iv *= 1000
-        return datetime.utcfromtimestamp(iv / 1000).strftime("%d.%m.%Y")
-    except Exception:
-        return "-"
-
-def _after_check_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="В главное меню", callback_data="check_home")],
-        [InlineKeyboardButton(text="Новая проверка", callback_data="check_new")],
-        [InlineKeyboardButton(text="Выход", callback_data="check_exit")],
-    ])
-
-def _format_report(d: dict) -> str:
-    management = d.get("management") or "-"
-    if ":" in management:
-        management = management.replace(":", ",", 1)
-    opf = d.get("opf_full") or d.get("opf_short") or "-"
-    status = (d.get("status") or "-").upper()
-    reg = _fmt_date_ms(d.get("registration_date") or d.get("ogrn_date"))
-    liq = _fmt_date_ms(d.get("liquidation_date"))
-    okved = d.get("okved") or {}
-    okved_code = okved.get("code")
-    okved_name = okved.get("name") or "-"
-    okved_line = f"{okved_code} — {okved_name}" if okved_code else "-"
-    phones = ", ".join(d.get("phones") or []) or "-"
-    emails = ", ".join(d.get("emails") or []) or "-"
-    website = d.get("website") or "-"
-
-    txt = (
-        f"🧾 <b>{d.get('name') or '-'}</b>\n"
-        f"ОПФ: {opf}\n"
-        f"Статус: {status}\n"
-        f"Дата регистрации: {reg}" + (f" • Ликвидация: {liq}" if liq != "-" else "") + "\n"
-        f"ИНН/КПП: {d.get('inn') or '-'} / {d.get('kpp') or '-'}\n"
-        f"ОГРН: {d.get('ogrn') or '-'}\n"
-        f"Адрес: {d.get('address') or '-'}\n"
-        f"Руководитель: {management}\n"
-        f"ОКВЭД (осн.): {okved_line}\n"
-        f"Сайт: {website}\n"
-        f"Тел.: {phones}\n"
-        f"Email: {emails}"
-    )
-    return txt
-
-# ----------------- Reply-клавиатуры: Старт → Главное меню -----------------
-
+# ---------- старт и главное меню ----------
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
@@ -104,15 +47,6 @@ async def on_start_pressed(m: Message, state: FSMContext):
     await _try_send(lambda: m.answer(
         "Выберите действие:",
         reply_markup=reply_main_menu_kb()
-    ))
-
-@router.message(F.text.casefold() == "запрос по инн")
-async def on_check_menu(m: Message, state: FSMContext):
-    await state.clear()
-    await _try_send(lambda: m.answer(
-        "Отправьте команду:\n"
-        "<code>/checkinn ИНН [КПП]</code>\n\n"
-        "Например: <code>/checkinn 7707083893</code>",
     ))
 
 @router.message(F.text.casefold() == "договор")
@@ -131,8 +65,7 @@ async def on_exit(m: Message, state: FSMContext):
         reply_markup=reply_remove()
     ))
 
-# ----------------- FSM поток «Договор» -----------------
-
+# ---------- FSM поток «Договор» ----------
 @router.callback_query(ContractFSM.contract_type, F.data.startswith("type_"))
 async def set_type(c: CallbackQuery, state: FSMContext):
     await state.update_data(contract_type="services")
@@ -242,16 +175,6 @@ async def output_choice(c: CallbackQuery, state: FSMContext):
 async def do_generate(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
-    provider = DaDataProvider()
-    customer_v = await provider.verify(inn=data["customer_inn"], kpp=data.get("customer_kpp"))
-    contractor_v = await provider.verify(inn=data["contractor_inn"], kpp=data.get("contractor_kpp"))
-
-    vr = {
-        "customer": customer_v,
-        "contractor": contractor_v,
-        "match": (customer_v.get("found") and contractor_v.get("found"))
-    }
-
     ci = ContractInput(
         contract_type="services",
         customer=Party(name=data["customer_name"], inn=data["customer_inn"], kpp=data.get("customer_kpp")),
@@ -262,7 +185,7 @@ async def do_generate(c: CallbackQuery, state: FSMContext):
             term=data["term"], penalties=data.get("penalties")
         ),
         output=data["output"],
-        verification_report=vr
+        verification_report=None
     )
 
     context = {
@@ -277,7 +200,7 @@ async def do_generate(c: CallbackQuery, state: FSMContext):
         "penalties": ci.params.penalties,
         "customer": ci.customer.model_dump(),
         "contractor": ci.contractor.model_dump(),
-        "verification_status": "OK" if vr.get("match") else "требуется проверка вручную"
+        "verification_status": "OK"
     }
 
     text = render_text(context)
@@ -297,17 +220,6 @@ async def do_generate(c: CallbackQuery, state: FSMContext):
     for f in files:
         await _try_send(lambda f=f: c.message.answer_document(f))
 
-    def line(v):
-        if not v.get("found"):
-            return "не найден"
-        return f"{v.get('name')} | ИНН {v.get('inn')} | ОГРН {v.get('ogrn')} | статус: {v.get('status')}"
-
-    await _try_send(lambda: c.message.answer(
-        "Проверка контрагентов:\n"
-        f"Заказчик: {line(customer_v)}\n"
-        f"Исполнитель: {line(contractor_v)}"
-    ))
-
     await state.clear()
     await c.answer()
 
@@ -315,57 +227,4 @@ async def do_generate(c: CallbackQuery, state: FSMContext):
 async def cancel(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await _try_send(lambda: c.message.answer("Ок, отменил. /start заново"))
-    await c.answer()
-
-# ----------------- /checkinn (быстрый режим) -----------------
-
-@router.message(Command("checkinn"))
-async def cmd_checkinn(m: Message):
-    parts = (m.text or "").split()
-    args = parts[1:] if len(parts) > 1 else []
-    if not args:
-        await _try_send(lambda: m.answer(
-            "Отправьте команду в формате:\n"
-            "<code>/checkinn ИНН [КПП]</code>\n\n"
-            "Например: <code>/checkinn 7707083893</code>"
-        ))
-        return
-
-    inn = "".join(ch for ch in args[0] if ch.isdigit())
-    kpp = "".join(ch for ch in (args[1] if len(args) > 1 else "")) or None
-
-    if len(inn) not in (10, 12):
-        await _try_send(lambda: m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова."))
-        return
-
-    provider = DaDataProvider()
-    info = await provider.verify(inn=inn, kpp=kpp)
-
-    if not info.get("found"):
-        await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_after_check_kb()))
-        return
-
-    await _try_send(lambda: m.answer(_format_report(info), reply_markup=_after_check_kb()))
-
-@router.callback_query(F.data == "check_home")
-async def check_home(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await _try_send(lambda: c.message.answer("Привет! Нажмите «Старт» ниже, чтобы открыть меню."))
-    await _try_send(lambda: c.message.answer("Меню:", reply_markup=reply_main_menu_kb()))
-    await c.answer()
-
-@router.callback_query(F.data == "check_new")
-async def check_new(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await _try_send(lambda: c.message.answer(
-        "Отправьте новый запрос в формате:\n"
-        "<code>/checkinn ИНН [КПП]</code>\n\n"
-        "Например: <code>/checkinn 7707083893</code>"
-    ))
-    await c.answer()
-
-@router.callback_query(F.data == "check_exit")
-async def check_exit(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await _try_send(lambda: c.message.answer("Спасибо за использование! Чтобы начать заново — /start"))
     await c.answer()

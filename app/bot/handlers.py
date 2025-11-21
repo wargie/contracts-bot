@@ -1,4 +1,5 @@
 import os
+import asyncio
 from datetime import datetime
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
@@ -20,7 +21,22 @@ from .keyboards import (
 
 router = Router()
 
-# ----------------- helpers for /checkinn -----------------
+# ----------------- утилиты -----------------
+
+async def _try_send(coro_factory, retries: int = 3, backoff: float = 1.0):
+    """
+    Надёжная отправка сообщения/редактирования:
+    coro_factory -> корутина без аргументов (например: lambda: message.answer(...))
+    """
+    last_exc = None
+    for i in range(retries):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            last_exc = e
+            await asyncio.sleep(backoff * (i + 1))
+    # если так и не получилось — пробрасываем последнюю ошибку
+    raise last_exc
 
 def _fmt_date_ms(v) -> str:
     if not v:
@@ -77,148 +93,148 @@ def _format_report(d: dict) -> str:
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer(
+    await _try_send(lambda: m.answer(
         "Привет! Нажми кнопку <b>Старт</b> ниже, чтобы открыть меню.",
         reply_markup=reply_start_kb()
-    )
+    ))
 
 @router.message(F.text.casefold() == "старт")
 async def on_start_pressed(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer(
+    await _try_send(lambda: m.answer(
         "Выберите действие:",
         reply_markup=reply_main_menu_kb()
-    )
+    ))
 
 @router.message(F.text.casefold() == "запрос по инн")
 async def on_check_menu(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer(
+    await _try_send(lambda: m.answer(
         "Отправьте команду:\n"
         "<code>/checkinn ИНН [КПП]</code>\n\n"
         "Например: <code>/checkinn 7707083893</code>",
-    )
+    ))
 
 @router.message(F.text.casefold() == "договор")
 async def on_contract_menu(m: Message, state: FSMContext):
     await state.set_state(ContractFSM.contract_type)
-    await m.answer(
+    await _try_send(lambda: m.answer(
         "Выберите тип договора:",
         reply_markup=choose_contract_type_kb()
-    )
+    ))
 
 @router.message(F.text.casefold() == "выход")
 async def on_exit(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer(
+    await _try_send(lambda: m.answer(
         "Спасибо за использование! Чтобы начать заново — /start",
         reply_markup=reply_remove()
-    )
+    ))
 
-# ----------------- FSM поток «Договор» (как раньше) -----------------
+# ----------------- FSM поток «Договор» -----------------
 
 @router.callback_query(ContractFSM.contract_type, F.data.startswith("type_"))
 async def set_type(c: CallbackQuery, state: FSMContext):
     await state.update_data(contract_type="services")
-    await c.message.edit_text("Введите полное наименование Заказчика:")
+    await _try_send(lambda: c.message.answer("Введите полное наименование Заказчика:"))
     await state.set_state(ContractFSM.customer_name)
     await c.answer()
 
 @router.message(ContractFSM.customer_name)
 async def customer_name(m: Message, state: FSMContext):
     await state.update_data(customer_name=m.text.strip())
-    await m.answer("ИНН Заказчика:")
+    await _try_send(lambda: m.answer("ИНН Заказчика:"))
     await state.set_state(ContractFSM.customer_inn)
 
 @router.message(ContractFSM.customer_inn)
 async def customer_inn(m: Message, state: FSMContext):
     await state.update_data(customer_inn=m.text.strip())
-    await m.answer("КПП Заказчика (если есть) или '-' :")
+    await _try_send(lambda: m.answer("КПП Заказчика (если есть) или '-' :"))
     await state.set_state(ContractFSM.customer_kpp)
 
 @router.message(ContractFSM.customer_kpp)
 async def customer_kpp(m: Message, state: FSMContext):
     kpp = None if m.text.strip() == '-' else m.text.strip()
     await state.update_data(customer_kpp=kpp)
-    await m.answer("Полное наименование Исполнителя:")
+    await _try_send(lambda: m.answer("Полное наименование Исполнителя:"))
     await state.set_state(ContractFSM.contractor_name)
 
 @router.message(ContractFSM.contractor_name)
 async def contractor_name(m: Message, state: FSMContext):
     await state.update_data(contractor_name=m.text.strip())
-    await m.answer("ИНН Исполнителя:")
+    await _try_send(lambda: m.answer("ИНН Исполнителя:"))
     await state.set_state(ContractFSM.contractor_inn)
 
 @router.message(ContractFSM.contractor_inn)
 async def contractor_inn(m: Message, state: FSMContext):
     await state.update_data(contractor_inn=m.text.strip())
-    await m.answer("КПП Исполнителя (если есть) или '-' :")
+    await _try_send(lambda: m.answer("КПП Исполнителя (если есть) или '-' :"))
     await state.set_state(ContractFSM.contractor_kpp)
 
 @router.message(ContractFSM.contractor_kpp)
 async def contractor_kpp(m: Message, state: FSMContext):
     kpp = None if m.text.strip() == '-' else m.text.strip()
     await state.update_data(contractor_kpp=kpp)
-    await m.answer("Номер договора:")
+    await _try_send(lambda: m.answer("Номер договора:"))
     await state.set_state(ContractFSM.params_number)
 
 @router.message(ContractFSM.params_number)
 async def params_number(m: Message, state: FSMContext):
     await state.update_data(number=m.text.strip())
-    await m.answer("Дата (напр. 30.09.2025):")
+    await _try_send(lambda: m.answer("Дата (напр. 30.09.2025):"))
     await state.set_state(ContractFSM.params_date)
 
 @router.message(ContractFSM.params_date)
 async def params_date(m: Message, state: FSMContext):
     await state.update_data(date=m.text.strip())
-    await m.answer("Город заключения:")
+    await _try_send(lambda: m.answer("Город заключения:"))
     await state.set_state(ContractFSM.params_city)
 
 @router.message(ContractFSM.params_city)
 async def params_city(m: Message, state: FSMContext):
     await state.update_data(city=m.text.strip())
-    await m.answer("Опишите предмет договора:")
+    await _try_send(lambda: m.answer("Опишите предмет договора:"))
     await state.set_state(ContractFSM.params_subject)
 
 @router.message(ContractFSM.params_subject)
 async def params_subject(m: Message, state: FSMContext):
     await state.update_data(subject=m.text.strip())
-    await m.answer("Стоимость (с валютой):")
+    await _try_send(lambda: m.answer("Стоимость (с валютой):"))
     await state.set_state(ContractFSM.params_price)
 
 @router.message(ContractFSM.params_price)
 async def params_price(m: Message, state: FSMContext):
     await state.update_data(price=m.text.strip())
-    await m.answer("Порядок расчетов:")
+    await _try_send(lambda: m.answer("Порядок расчетов:"))
     await state.set_state(ContractFSM.params_payment)
 
 @router.message(ContractFSM.params_payment)
 async def params_payment(m: Message, state: FSMContext):
     await state.update_data(payment=m.text.strip())
-    await m.answer("Срок исполнения/действия:")
+    await _try_send(lambda: m.answer("Срок исполнения/действия:"))
     await state.set_state(ContractFSM.params_term)
 
 @router.message(ContractFSM.params_term)
 async def params_term(m: Message, state: FSMContext):
     await state.update_data(term=m.text.strip())
-    await m.answer("Штрафные санкции (или '-' ):")
+    await _try_send(lambda: m.answer("Штрафные санкции (или '-' ):"))
     await state.set_state(ContractFSM.params_penalties)
 
 @router.message(ContractFSM.params_penalties)
 async def params_penalties(m: Message, state: FSMContext):
     penalties = None if m.text.strip() == '-' else m.text.strip()
     await state.update_data(penalties=penalties)
-    await m.answer("Выберите формат файла:", reply_markup=choose_output_kb())
+    await _try_send(lambda: m.answer("Выберите формат файла:", reply_markup=choose_output_kb()))
     await state.set_state(ContractFSM.output_format)
 
 @router.callback_query(ContractFSM.output_format, F.data.startswith("out_"))
 async def output_choice(c: CallbackQuery, state: FSMContext):
     mapping = {"out_docx": "docx", "out_pdf": "pdf", "out_both": "both"}
     await state.update_data(output=mapping[c.data])
-    await c.message.edit_text(
+    await _try_send(lambda: c.message.answer(
         "Проверяю реквизиты и готовлю предпросмотр... Подтвердите формирование:",
         reply_markup=confirm_kb()
-    )
+    ))
     await state.set_state(ContractFSM.confirm)
     await c.answer()
 
@@ -277,20 +293,20 @@ async def do_generate(c: CallbackQuery, state: FSMContext):
         text_to_pdf(text, path_pdf)
         files.append(FSInputFile(path_pdf))
 
-    await c.message.answer("Готово. Вот файлы:")
+    await _try_send(lambda: c.message.answer("Готово. Вот файлы:"))
     for f in files:
-        await c.message.answer_document(f)
+        await _try_send(lambda f=f: c.message.answer_document(f))
 
     def line(v):
         if not v.get("found"):
             return "не найден"
         return f"{v.get('name')} | ИНН {v.get('inn')} | ОГРН {v.get('ogrn')} | статус: {v.get('status')}"
 
-    await c.message.answer(
-        "Проверка контрагентов:\n"+
-        f"Заказчик: {line(customer_v)}\n"+
+    await _try_send(lambda: c.message.answer(
+        "Проверка контрагентов:\n"
+        f"Заказчик: {line(customer_v)}\n"
         f"Исполнитель: {line(contractor_v)}"
-    )
+    ))
 
     await state.clear()
     await c.answer()
@@ -298,60 +314,58 @@ async def do_generate(c: CallbackQuery, state: FSMContext):
 @router.callback_query(ContractFSM.confirm, F.data == "confirm_no")
 async def cancel(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await c.message.edit_text("Ок, отменил. /start заново")
+    await _try_send(lambda: c.message.answer("Ок, отменил. /start заново"))
     await c.answer()
 
-# ----------------- /checkinn (быстрый режим без FSM) -----------------
+# ----------------- /checkinn (быстрый режим) -----------------
 
 @router.message(Command("checkinn"))
 async def cmd_checkinn(m: Message):
     parts = (m.text or "").split()
     args = parts[1:] if len(parts) > 1 else []
     if not args:
-        await m.answer(
+        await _try_send(lambda: m.answer(
             "Отправьте команду в формате:\n"
             "<code>/checkinn ИНН [КПП]</code>\n\n"
             "Например: <code>/checkinn 7707083893</code>"
-        )
+        ))
         return
 
     inn = "".join(ch for ch in args[0] if ch.isdigit())
     kpp = "".join(ch for ch in (args[1] if len(args) > 1 else "")) or None
 
     if len(inn) not in (10, 12):
-        await m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова.")
+        await _try_send(lambda: m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова."))
         return
 
     provider = DaDataProvider()
     info = await provider.verify(inn=inn, kpp=kpp)
 
     if not info.get("found"):
-        await m.answer("Компания не найдена по указанному ИНН.", reply_markup=_after_check_kb())
+        await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_after_check_kb()))
         return
 
-    await m.answer(_format_report(info), reply_markup=_after_check_kb())
+    await _try_send(lambda: m.answer(_format_report(info), reply_markup=_after_check_kb()))
 
 @router.callback_query(F.data == "check_home")
 async def check_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await c.message.edit_text(
-        "Привет! Нажмите «Старт» ниже, чтобы открыть меню.",
-    )
-    await c.message.answer("Меню:", reply_markup=reply_main_menu_kb())
+    await _try_send(lambda: c.message.answer("Привет! Нажмите «Старт» ниже, чтобы открыть меню."))
+    await _try_send(lambda: c.message.answer("Меню:", reply_markup=reply_main_menu_kb()))
     await c.answer()
 
 @router.callback_query(F.data == "check_new")
 async def check_new(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await c.message.edit_text(
+    await _try_send(lambda: c.message.answer(
         "Отправьте новый запрос в формате:\n"
         "<code>/checkinn ИНН [КПП]</code>\n\n"
         "Например: <code>/checkinn 7707083893</code>"
-    )
+    ))
     await c.answer()
 
 @router.callback_query(F.data == "check_exit")
 async def check_exit(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await c.message.edit_text("Спасибо за использование! Чтобы начать заново — /start")
+    await _try_send(lambda: c.message.answer("Спасибо за использование! Чтобы начать заново — /start"))
     await c.answer()

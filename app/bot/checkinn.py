@@ -263,6 +263,19 @@ def _html_to_plain(s: str) -> str:
     return html.unescape(no_tags)
 
 
+# --- NEW: нормализация текста для PDF (убираем эмодзи и служебные вариации) ---
+_EMOJI_STRIP = {
+    "🧾": "", "🔢": "", "📚": "", "📍": "", "☎️": "", "🏛️": "",
+    "—": "—",  # оставляем длинное тире как есть
+}
+def _normalize_for_pdf(s: str) -> str:
+    for k, v in _EMOJI_STRIP.items():
+        s = s.replace(k, v)
+    # удалить вариационные селекторы/ZWJ
+    s = re.sub(r"[\u200D\uFE0F]", "", s)
+    return s.strip()
+
+
 # -------- entry points --------
 @router.message(F.text.casefold() == "запрос по инн")
 async def on_check_menu(m: Message, state: FSMContext):
@@ -334,9 +347,11 @@ async def check_save_pdf(c: CallbackQuery, state: FSMContext):
         await c.answer("Не удалось сформировать PDF, повторите проверку.", show_alert=True)
         return
 
+    pdf_text = _normalize_for_pdf(report_plain)  # <-- без эмодзи и управляющих меток
+
     os.makedirs("out", exist_ok=True)
     out_path = f"out/checkinn_{inn}.pdf"
-    text_to_pdf(report_plain, out_path)
+    text_to_pdf(pdf_text, out_path)
     await _try_send(lambda: c.message.answer_document(FSInputFile(out_path), caption=f"Отчёт по ИНН {inn}"))
     await c.answer()
 

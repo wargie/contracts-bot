@@ -1,18 +1,18 @@
-# Бот «Составитель договоров» — MVP
+# Contracts Bot (Telegram)
 
-## Установка и запуск
-```bash
+Телеграм-бот для составления договоров и проверки контрагентов по ИНН (DaData). Поддерживает генерацию DOCX/PDF, нумерацию договоров и реестр.
+
+## Быстрый старт (Windows 11)
+
+```powershell
+git clone https://github.com/wargie/contracts-bot.git
+cd contracts-bot
+
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cp .env
-python app/main.py
-```
 
-## Переменные окружения
-- TELEGRAM_BOT_TOKEN — токен бота
-- DADATA_API_TOKEN — токен DaData (верификация контрагентов)
-- BOT_ADMINS — список id через запятую (опционально)
+copy .env.example .env
+# отредактируйте .env: TELEGRAM_BOT_TOKEN, DADATA_API_TOKEN
 
-## Структура
-См. каталог `app/` и комментарии в коде.
+python -m app.main

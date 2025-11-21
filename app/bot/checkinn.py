@@ -1,384 +1,286 @@
+# app/bot/checkinn.py
+from __future__ import annotations
+
 import os
 import re
-import html
-import asyncio
 from datetime import datetime
+from typing import Dict, Optional, Tuple
 
 from aiogram import Router, F
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    FSInputFile,
-)
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
-from ..verification.dadata import DaDataProvider
-from ..services.contract_builder import text_to_pdf
-from .keyboards import reply_main_menu_kb
+from app.verification.dadata import DaDataProvider
 
-router = Router()
+# Для генерации PDF с кириллицей
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from app.services.contract_builder import _ensure_cyrillic_font  # уже есть в проекте
+
+router = Router(name="checkinn")
 
 
-class CheckInnFSM(StatesGroup):
+# ---------- FSM ----------
+
+class CheckInnStates(StatesGroup):
     wait_inn = State()
-    view = State()  # показываем готовый отчёт и ждём действия
 
 
-# -------- helpers --------
-async def _try_send(coro_factory, retries: int = 3, backoff: float = 1.0):
-    last_exc = None
-    for i in range(retries):
-        try:
-            return await coro_factory()
-        except Exception as e:
-            last_exc = e
-            await asyncio.sleep(backoff * (i + 1))
-    raise last_exc
+# ---------- Helpers ----------
 
+def _str(x: Optional[str]) -> str:
+    return x if isinstance(x, str) and x.strip() else ""
 
-def _ms_to_str(v) -> str:
-    if not v:
-        return ""
+def _dash(x: Optional[str]) -> str:
+    v = _str(x)
+    return v if v else "-"
+
+def _ts_to_date(ms: Optional[int]) -> str:
     try:
-        iv = int(v)
-        return datetime.utcfromtimestamp(iv / 1000).strftime("%d.%m.%Y")
+        if not ms:
+            return "-"
+        return datetime.utcfromtimestamp(ms / 1000).strftime("%d.%m.%Y")
     except Exception:
-        return ""
+        return "-"
 
+def _extract_okved(info: Dict) -> str:
+    okved = info.get("okved") or {}
+    code = _str(okved.get("code"))
+    name = _str(okved.get("name"))
+    parts = [p for p in (code, name) if p]
+    return " — ".join(parts) if parts else "-"
 
-def _line(label: str, value: str) -> str:
-    return f"{label}: {value}" if value else ""
+def _extract_contacts(info: Dict) -> Tuple[str, str]:
+    """
+    Поддерживаем оба варианта:
+    - phone/email на верхнем уровне
+    - phones/emails — списки от DaData
+    """
+    phone = info.get("phone")
+    email = info.get("email")
 
+    # из «сырых» данных
+    dadata = info.get("dadata") or {}
+    phones = dadata.get("phones") or []
+    emails = dadata.get("emails") or []
 
-def _join_nonempty(lines: list[str], sep: str = "\n") -> str:
-    return sep.join([ln for ln in lines if ln])
-
-
-def _kb_after() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💾 Сохранить PDF", callback_data="check_pdf")],
-            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="check_home")],
-            [InlineKeyboardButton(text="🔁 Новая проверка", callback_data="check_new")],
-            [InlineKeyboardButton(text="🚪 Выход", callback_data="check_exit")],
-        ]
-    )
-
-
-def _compose_blocks(info: dict) -> list[str]:
-    """Собираем логические блоки отчёта (в HTML)."""
-    s = info.get("summary", info)
-    d = info.get("details", {})
-
-    opf = s.get("opf_full") or s.get("opf_short") or ""
-    status = (s.get("status") or "").upper()
-    reg = _ms_to_str(s.get("registration_date") or s.get("ogrn_date"))
-    liq = _ms_to_str(s.get("liquidation_date"))
-
-    okved = s.get("okved") or {}
-    okved_line = " — ".join([okved.get("code", ""), okved.get("name", "")]).strip(" —")
-
-    ids = (d.get("ids") or {})
-    subj_type = d.get("type")
-    kpp = ids.get("kpp") if subj_type == "LEGAL" else None
-    ogrn_label = "ОГРНИП" if subj_type == "INDIVIDUAL" else "ОГРН"
-
-    header = _join_nonempty(
-        [
-            f"🧾 <b>{s.get('name') or '-'}</b>",
-            _line("ОПФ", opf),
-            _line("Статус", status),
-            _join_nonempty(
-                [_line("Дата регистрации", reg), _line("Ликвидация", liq)], " • "
-            ),
-            _join_nonempty(
-                [f"ИНН {s.get('inn') or ''}", f"КПП {kpp}" if kpp else ""], " / "
-            ),
-            _line(ogrn_label, s.get("ogrn") or ""),
-            _line("Адрес", s.get("address") or ""),
-            _line("Руководитель", (s.get("management") or "").replace(":", ",", 1)),
-            _line("ОКВЭД (осн.)", okved_line),
-        ]
-    )
-
-    # Коды/даты
-    st = d.get("state") or {}
-    codes = _join_nonempty(
-        [
-            "🔢 <b>Коды и даты</b>",
-            _join_nonempty(
-                [
-                    f"ОКПО: {ids.get('okpo')}" if ids.get("okpo") else "",
-                    f"ОКАТО: {ids.get('okato')}" if ids.get("okato") else "",
-                    f"ОКТМО: {ids.get('oktmo')}" if ids.get("oktmo") else "",
-                ],
-                " • ",
-            ),
-            _join_nonempty(
-                [
-                    f"ОКОГУ: {ids.get('okogu')}" if ids.get("okogu") else "",
-                    f"ОКФС: {ids.get('okfs')}" if ids.get("okfs") else "",
-                ],
-                " • ",
-            ),
-            _line("Дата присвоения ОГРН", _ms_to_str(d.get("ogrn_date"))),
-            _line("Актуальность данных", _ms_to_str(st.get("actuality_date"))),
-            _join_nonempty(
-                [
-                    f"Признак филиала: {(d.get('branch') or {}).get('branch_type')}"
-                    if (d.get("branch") or {}).get("branch_type")
-                    and subj_type == "LEGAL"
-                    else "",
-                    f"Филиалов: {(d.get('branch') or {}).get('branch_count')}"
-                    if (d.get("branch") or {}).get("branch_count")
-                    and subj_type == "LEGAL"
-                    else "",
-                ],
-                " • ",
-            ),
-        ]
-    )
-
-    # Доп. ОКВЭДы
-    okveds = (d.get("okved") or {}).get("list") or []
-    okved_block = ""
-    if okveds:
-        okved_list = "\n".join(
-            [
-                f"{it.get('code')} — {it.get('name') or ''}".strip(" —")
-                for it in okveds[:40]
-            ]
-        )
-        okved_block = "📚 <b>Доп. ОКВЭДы</b>\n" + okved_list
-
-    # Адрес подробно
-    ad = ((d.get("address") or {}).get("data")) or {}
-    addr_lines = _join_nonempty(
-        [
-            "📍 <b>Адрес подробно</b>",
-            _join_nonempty(
-                [
-                    f"Индекс: {ad.get('postal_code')}" if ad.get("postal_code") else "",
-                    f"Налоговая: {ad.get('tax_office')}" if ad.get("tax_office") else "",
-                ],
-                " • ",
-            ),
-            _line("Регион", ad.get("region_with_type") or ""),
-            _join_nonempty(
-                [
-                    f"Город/р-н: {(ad.get('city_with_type') or '')}",
-                    f"{(ad.get('city_district_with_type') or '')}",
-                ],
-                ", ",
-            ),
-            _join_nonempty(
-                [f"Улица/дом: {(ad.get('street_with_type') or '')}", f"{ad.get('house') or ''}"],
-                ", ",
-            ),
-            _join_nonempty(
-                [
-                    f"FIAС: {ad.get('fias_id')} (lvl {ad.get('fias_level')})"
-                    if ad.get("fias_id")
-                    else "",
-                    f"КЛАДР: {ad.get('kladr_id')}" if ad.get("kladr_id") else "",
-                ],
-                " • ",
-            ),
-            _join_nonempty(
-                [
-                    f"Координаты: {ad.get('geo_lat')}, {ad.get('geo_lon')}"
-                    if ad.get("geo_lat") and ad.get("geo_lon")
-                    else "",
-                    f"Часовой пояс: {ad.get('timezone')}" if ad.get("timezone") else "",
-                ],
-                " • ",
-            ),
-        ]
-    )
-
-    # Контакты
-    contacts = d.get("contacts") or {}
-    phones = ", ".join(contacts.get("phones") or [])
-    emails = ", ".join(contacts.get("emails") or [])
-    contacts_block = _join_nonempty(
-        [
-            "☎️ <b>Контакты</b>",
-            _line("Телефоны", phones),
-            _line("E-mail", emails),
-            _line("Сайт", contacts.get("website") or ""),
-        ]
-    )
-
-    # Прочее
-    capital = d.get("capital") or {}
-    emp = d.get("employee_count")
-    misc = _join_nonempty(
-        [
-            "🏛️ <b>Дополнительно</b>",
-            _line(
-                "Уставный капитал",
-                f"{capital.get('value')} ({capital.get('type')})"
-                if capital.get("value")
-                else "",
-            ),
-            _line("Численность сотрудников", str(emp) if emp is not None else ""),
-            _join_nonempty(
-                [
-                    "Документы" if d.get("documents") else "",
-                    "Лицензии" if d.get("licenses") else "",
-                    "Органы" if d.get("authorities") else "",
-                ]
-            ),
-        ]
-    )
-
-    return [header, codes, addr_lines, contacts_block, okved_block, misc]
-
-
-def _fit_blocks_to_telegram_limit(blocks: list[str], max_len: int = 3800) -> str:
-    """Собираем из блоков одно сообщение, не превышая лимит Telegram (≈4096)."""
-    out: list[str] = []
-    for b in blocks:
-        test = "\n\n".join(out + [b])
-        if len(test) <= max_len:
-            out.append(b)
+    if not phone and phones and isinstance(phones, list):
+        # объект может быть строкой или словарём
+        p0 = phones[0]
+        if isinstance(p0, dict):
+            phone = p0.get("value") or p0.get("data") or ""
         else:
-            if len("\n\n".join(out)) < max_len:
-                remain = max_len - len("\n\n".join(out)) - 1
-                trimmed = (b[:remain]).rsplit("\n", 1)[0]
-                if trimmed.strip():
-                    out.append(trimmed + "\n…")
-            break
-    return "\n\n".join(out)
+            phone = str(p0)
+
+    if not email and emails and isinstance(emails, list):
+        e0 = emails[0]
+        if isinstance(e0, dict):
+            email = e0.get("value") or e0.get("data") or ""
+        else:
+            email = str(e0)
+
+    return _dash(_str(phone)), _dash(_str(email))
+
+def _extract_manager(info: Dict) -> str:
+    # уже собранная строка в provider: "ДОЛЖНОСТЬ, ФИО"
+    mgmt = _str(info.get("management"))
+    if not mgmt:
+        # попытка вытащить из "сырых"
+        raw = (info.get("dadata") or {}).get("management") or {}
+        post = _str(raw.get("post"))
+        name = _str(raw.get("name"))
+        mgmt = ", ".join([p for p in (post, name) if p])
+    # просьба была — «после генеральный директор поставить запятую, а не двоеточие»
+    mgmt = mgmt.replace(":", ",")
+    return _dash(mgmt)
+
+def _status_line(info: Dict) -> str:
+    st = _str(info.get("status"))
+    return st if st else "-"
+
+def _ogrn_line(info: Dict) -> str:
+    return _dash(_str(info.get("ogrn")))
+
+def _short_opf_name(info: Dict) -> str:
+    opf = info.get("opf") or {}
+    short = _str(opf.get("short"))
+    full = _str(opf.get("full"))
+    return short or full or "-"
+
+def _full_name(info: Dict) -> str:
+    # В отчёте хотели красивое имя
+    return _dash(_str(info.get("name_short")) or _str(info.get("name")))
+
+def _reg_date(info: Dict) -> str:
+    # Пользователь просил «дата основания/регистрации»
+    # В DaData это state.registration_date или ogrn_date — используем оба варианта, что есть.
+    date1 = info.get("registration_date")
+    if date1:
+        return _ts_to_date(date1)
+    # запасной вариант
+    return _ts_to_date(info.get("ogrn_date"))
 
 
-def _html_to_plain(s: str) -> str:
-    no_tags = re.sub(r"<[^>]+>", "", s)
-    return html.unescape(no_tags)
+# ---------- Report building ----------
+
+def _compose_report(info: Dict) -> str:
+    """
+    Один красивый текст отчёта.
+    """
+    title = _full_name(info)
+
+    opf_short = _short_opf_name(info)
+    status = _status_line(info)
+
+    inn = _dash(_str(info.get("inn")))
+    kpp = _dash(_str(info.get("kpp")))
+    ogrn = _ogrn_line(info)
+    addr = _dash(_str(info.get("address")))
+    manager = _extract_manager(info)
+    okved = _extract_okved(info)
+    phone, email = _extract_contacts(info)
+    reg_date = _reg_date(info)
+
+    # Формат как просили ранее: статус и ОГРН — на отдельных строках,
+    # после должности запятая.
+    lines = [
+        f"🏢 {title}",
+        f"ОПФ: {opf_short}",
+        f"Статус: {status}",
+        f"Дата регистрации: {reg_date}",
+        f"ИНН/КПП: {inn} / {kpp}",
+        f"ОГРН: {ogrn}",
+        f"Адрес: {addr}",
+        f"Руководитель: {manager}",
+        f"ОКВЭД (осн.): {okved}",
+        f"Сайт: {_dash(_str((info.get('site') or info.get('website'))))}",
+        f"Тел.: {phone}",
+        f"Email: {email}",
+    ]
+    return "\n".join(lines)
 
 
-# --- нормализация текста для PDF (убираем эмодзи и служебные вариации) ---
-_EMOJI_STRIP = {
-    "🧾": "", "🔢": "", "📚": "", "📍": "", "☎️": "", "🏛️": "",
-    "—": "—",
-}
-def _normalize_for_pdf(s: str) -> str:
-    for k, v in _EMOJI_STRIP.items():
-        s = s.replace(k, v)
-    s = re.sub(r"[\u200D\uFE0F]", "", s)
-    return s.strip()
+# ---------- PDF ----------
+
+def _report_to_pdf(text: str, out_path: str) -> str:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    font_name = _ensure_cyrillic_font()  # вернёт, например, "Arial" или "DejaVuSans"
+
+    c = canvas.Canvas(out_path, pagesize=A4)
+    width, height = A4
+    left, top, line_h = 40, height - 40, 14
+
+    text_obj = c.beginText()
+    text_obj.setTextOrigin(left, top)
+    text_obj.setFont(font_name, 10)
+
+    # Перенос по ширине страницы грубым способом
+    import textwrap
+    wrap_width = 95
+
+    for paragraph in text.split("\n"):
+        for wrapped in textwrap.wrap(paragraph, width=wrap_width, replace_whitespace=False, drop_whitespace=False):
+            text_obj.textLine(wrapped)
+        # пустая строка между логическими блоками
+        # (тут каждый абзац — это уже строка, поэтому просто перенос)
+    c.drawText(text_obj)
+    c.showPage()
+    c.save()
+    return out_path
 
 
-# -------- entry points --------
+# ---------- Keyboards ----------
 
-# Кнопка «Запрос по ИНН» в главном меню (регистронезависимо)
-@router.message(F.text.regexp(r"(?i)^запрос по инн$"))
-async def on_check_menu(m: Message, state: FSMContext):
-    await state.set_state(CheckInnFSM.wait_inn)
-    await _try_send(lambda: m.answer("Введите ИНН компании"))
-
-# Обработчик ввода ИНН, когда ждём ИНН
-@router.message(CheckInnFSM.wait_inn, F.text.regexp(r"^\s*\d{10,12}\s*$|^\s*\d{10}\s+\d{9}\s*$"))
-async def on_inn_entered(m: Message, state: FSMContext):
-    raw = (m.text or "").strip()
-    # поддержим "ИНН" или "ИНН КПП"
-    parts = raw.split()
-    inn = "".join(ch for ch in parts[0] if ch.isdigit())
-    kpp = None
-    if len(parts) >= 2:
-        kpp = "".join(ch for ch in parts[1] if ch.isdigit())
-
-    if len(inn) not in (10, 12):
-        await _try_send(lambda: m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова."))
-        return
-
-    info = await DaDataProvider().verify(inn=inn, kpp=kpp)
-    if not info.get("found"):
-        await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_kb_after()))
-        await state.clear()
-        return
-
-    blocks = _compose_blocks(info)
-    report_html = _fit_blocks_to_telegram_limit(blocks)
-    report_plain = _html_to_plain(report_html)
-
-    await state.update_data(report_html=report_html, report_plain=report_plain, inn=inn)
-    await state.set_state(CheckInnFSM.view)
-
-    await _try_send(lambda: m.answer(report_html, parse_mode=ParseMode.HTML, reply_markup=_kb_after()))
-
-# Альтернативная команда /checkinn 7707083893
-@router.message(Command("checkinn"))
-async def cmd_checkinn(m: Message, state: FSMContext):
-    parts = (m.text or "").split()
-    args = parts[1:] if len(parts) > 1 else []
-    if not args:
-        await state.set_state(CheckInnFSM.wait_inn)
-        await _try_send(lambda: m.answer("Введите ИНН компании"))
-        return
-
-    inn = "".join(ch for ch in args[0] if ch.isdigit())
-    kpp = None
-    if len(args) >= 2:
-        kpp = "".join(ch for ch in args[1] if ch.isdigit())
-
-    if len(inn) not in (10, 12):
-        await _try_send(lambda: m.answer("ИНН должен содержать 10 или 12 цифр. Попробуйте снова."))
-        return
-
-    info = await DaDataProvider().verify(inn=inn, kpp=kpp)
-    if not info.get("found"):
-        await _try_send(lambda: m.answer("Компания не найдена по указанному ИНН.", reply_markup=_kb_after()))
-        return
-
-    blocks = _compose_blocks(info)
-    report_html = _fit_blocks_to_telegram_limit(blocks)
-    report_plain = _html_to_plain(report_html)
-
-    await state.update_data(report_html=report_html, report_plain=report_plain, inn=inn)
-    await state.set_state(CheckInnFSM.view)
-
-    await _try_send(lambda: m.answer(report_html, parse_mode=ParseMode.HTML, reply_markup=_kb_after()))
+def _kb_after_report() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Новая проверка", callback_data="checkinn:new")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="checkinn:menu")],
+        [InlineKeyboardButton(text="🚪 Выход", callback_data="checkinn:exit")],
+    ])
 
 
-# -------- actions after report --------
-@router.callback_query(CheckInnFSM.view, F.data == "check_pdf")
-async def check_save_pdf(c: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    report_plain = data.get("report_plain")
-    inn = data.get("inn") or "report"
+# ---------- Entry points ----------
 
-    if not report_plain:
-        await c.answer("Не удалось сформировать PDF, повторите проверку.", show_alert=True)
-        return
+def checkinn_menu_kb() -> InlineKeyboardMarkup:
+    """Кнопка для основного меню (используется в handlers)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Проверка по ИНН", callback_data="checkinn:start")]
+    ])
 
-    pdf_text = _normalize_for_pdf(report_plain)
 
-    os.makedirs("out", exist_ok=True)
-    out_path = f"out/checkinn_{inn}.pdf"
-    text_to_pdf(pdf_text, out_path)
-    await _try_send(lambda: c.message.answer_document(FSInputFile(out_path), caption=f"Отчёт по ИНН {inn}"))
+@router.callback_query(F.data == "checkinn:start")
+async def check_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(CheckInnStates.wait_inn)
+    await c.message.edit_text("Введите ИНН компании (10 или 12 цифр). Можно указать «ИНН КПП» через пробел для филиалов.")
     await c.answer()
 
-@router.callback_query(F.data == "check_home")
-async def check_home(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await _try_send(lambda: c.message.answer("Меню:", reply_markup=reply_main_menu_kb()))
-    await c.answer()
 
-@router.callback_query(F.data == "check_new")
+@router.callback_query(F.data == "checkinn:new")
 async def check_new(c: CallbackQuery, state: FSMContext):
-    await state.set_state(CheckInnFSM.wait_inn)
-    await _try_send(lambda: c.message.answer("Введите ИНН компании"))
+    await state.set_state(CheckInnStates.wait_inn)
+    await c.message.edit_text("Введите ИНН компании (10 или 12 цифр). Можно указать «ИНН КПП» через пробел для филиалов.")
     await c.answer()
 
-@router.callback_query(F.data == "check_exit")
-async def check_exit(c: CallbackQuery, state: FSMContext):
+
+@router.callback_query(F.data == "checkinn:menu")
+async def back_to_menu(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await _try_send(lambda: c.message.answer("Спасибо за использование! Чтобы начать заново — /start"))
+    # Основное меню показывает /start
+    await c.message.edit_text("Возвращаю в главное меню… Нажмите /start")
     await c.answer()
+
+
+@router.callback_query(F.data == "checkinn:exit")
+async def exit_flow(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.edit_text("Спасибо за использование! Чтобы начать заново — /start")
+    await c.answer()
+
+
+# ---------- INN handler ----------
+
+_INN_RE = re.compile(r"^\s*(\d{10}|\d{12})(?:\s+(\d{9}))?\s*$")
+
+def _parse_inn_kpp(text: str) -> Tuple[Optional[str], Optional[str]]:
+    m = _INN_RE.match(text or "")
+    if not m:
+        return None, None
+    inn = m.group(1)
+    kpp = m.group(2)
+    return inn, kpp
+
+
+@router.message(CheckInnStates.wait_inn)
+async def on_inn_entered(m: Message, state: FSMContext):
+    inn, kpp = _parse_inn_kpp(m.text or "")
+    if not inn:
+        await m.answer("Не распознал ИНН. Введите 10 или 12 цифр (опционально через пробел КПП — 9 цифр).")
+        return
+
+    await m.chat.do("typing")
+    provider = DaDataProvider()
+    info = await provider.verify(inn=inn, kpp=kpp)
+
+    if not info.get("found"):
+        await m.answer("Ничего не найдено по указанным данным. Проверьте ИНН/КПП и попробуйте снова.", reply_markup=_kb_after_report())
+        await state.set_state(CheckInnStates.wait_inn)
+        return
+
+    # 1) Собираем единый текст
+    report_text = _compose_report(info)
+
+    # 2) Отправляем единым сообщением
+    await m.answer(report_text, reply_markup=_kb_after_report())
+
+    # 3) Готовим PDF и отправляем
+    safe_inn = inn
+    out_dir = os.path.join("out", "reports")
+    os.makedirs(out_dir, exist_ok=True)
+    pdf_path = os.path.join(out_dir, f"inn_{safe_inn}.pdf")
+    _report_to_pdf(report_text, pdf_path)
+    await m.answer_document(FSInputFile(pdf_path))
+
+    # остаёмся в состоянии новой проверки, чтобы можно было вводить следующий ИНН
+    await state.set_state(CheckInnStates.wait_inn)

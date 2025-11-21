@@ -1,0 +1,8 @@
+aiogram>=3.7
+aiohttp>=3.9
+Jinja2>=3.1
+python-docx>=1.1
+reportlab>=4.2
+pydantic>=2.7
+python-dotenv>=1.0
+docxtpl>=0.16.7
